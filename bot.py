@@ -1,11 +1,27 @@
 import glob
 import os
+from threading import Thread
+from flask import Flask
 import telebot
 import yt_dlp
 
-# Botingizning tokeni qo'shildi:
-TOKEN = "8879769179:AAEO_10-ElzL59qpU-RfjEdGJ9OPp7gdVyA"
+# Render uchun veb-server
+app = Flask("")
 
+
+@app.route("/")
+def home():
+  return "Bot ishlayapti va 24/7 rejimda!"
+
+
+def run_web():
+  # Render avtomatik beradigan PORT'ni olamiz
+  port = int(os.environ.get("PORT", 8080))
+  app.run(host="0.0.0.0", port=port)
+
+
+# Botingiz tokeni
+TOKEN = "8879769179:AAEO_10-ElzL59qpU-RfjEdGJ9OPp7gdVyA"
 bot = telebot.TeleBot(TOKEN)
 
 
@@ -23,17 +39,14 @@ def handle_message(message):
   query = message.text
   chat_id = message.chat.id
 
-  # Foydalanuvchiga qidirilayotgani haqida xabar beramiz
   wait_msg = bot.send_message(
       chat_id, "🔍 Qo‘shiq qidirilmoqda va yuklanmoqda, biroz kuting..."
   )
 
   try:
-    # Oldingi qolgan vaqtincha fayllarni tozalaymiz
     for f in glob.glob("song.*"):
       os.remove(f)
 
-    # YouTube'dan audio qidirish va yuklab olish sozlamalari
     ydl_opts = {
         "format": "bestaudio",
         "outtmpl": "song.%(ext)s",
@@ -44,14 +57,12 @@ def handle_message(message):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
       ydl.download([query])
 
-    # Yuklab olingan musiqani topib Telegramga yuboramiz
     files = glob.glob("song.*")
     if files:
       audio_file_path = files[0]
       with open(audio_file_path, "rb") as audio:
         bot.send_audio(chat_id, audio)
 
-      # Xabarni o'chirib, telefon xotirasidagi vaqtincha faylni tozalaymiz
       bot.delete_message(chat_id, wait_msg.message_id)
       os.remove(audio_file_path)
     else:
@@ -66,5 +77,9 @@ def handle_message(message):
 
 
 if __name__ == "__main__":
-  print("Bot muvaffaqiyatli ishga tushdi...")
+  # Veb-serverni alohida yo'nalishda ishga tushiramiz
+  t = Thread(target=run_web)
+  t.start()
+
+  print("Bot Render uchun tayyor va ishga tushdi...")
   bot.polling(none_stop=True)
