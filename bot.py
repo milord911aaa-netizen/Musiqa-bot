@@ -1,12 +1,23 @@
 # bot.py
 import os
-import re
+import glob
+import logging
 import threading
 import time
+import traceback
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import yt_dlp
 from flask import Flask
+
+# ------------------------------------------------------------------
+# LOGGING SOZLAMALARI (Xatoliklarni Render loglarida ko'rish uchun)
+# ------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------
 # SOZLAMALAR
@@ -14,20 +25,18 @@ from flask import Flask
 TOKEN = "8879769179:AAEO_10-ElzL59qpU-RfjEdGJ9OPp7gdVyA"
 bot = telebot.TeleBot(TOKEN)
 
-# Qidiruv natijalarini vaqtincha saqlash uchun lug'at
-# Kalit: foydalanuvchi ID si, Qiymat: qo'shiqlar ro'yxati
-user_search_results = {}
-
-# Audio fayllar saqlanadigan papka
-DOWNLOAD_DIR = "downloads"
+# Render serverida vaqtinchalik fayllar uchun /tmp papkasidan foydalanish xavfsizroq
+DOWNLOAD_DIR = "/tmp/downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
+user_search_results = {}
+
 # ------------------------------------------------------------------
-# YT-DLP SOZLAMALARI (YouTube blokirovkalarini chetlab o'tish)
+# YT-DLP SOZLAMALARI (Blokirovkalarni chetlab o'tish)
 # ------------------------------------------------------------------
 YDL_OPTS = {
     'format': 'bestaudio/best',
-    'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
+    'outtmpl': os.path.join(DOWNLOAD_DIR, '%(id)s.%(ext)s'),
     'postprocessors': [{
         'key': 'FFmpegExtractAudio',
         'preferredcodec': 'mp3',
@@ -35,16 +44,18 @@ YDL_OPTS = {
     }],
     'quiet': True,
     'no_warnings': True,
-    # Render IP-manzilini bloklamasligi uchun maxsus sozlama
+    'noplaylist': True,
+    # YouTube blokirovkasini chetlab o'tish uchun mijozlarni kengaytirdik
     'extractor_args': {
         'youtube': {
-            'player_client': ['android']
+            'player_client': ['android', 'ios', 'web'],
+            'skip': ['hls', 'dash']
         }
     }
 }
 
 # ------------------------------------------------------------------
-# FLASK VEB-SERVER (Render.com uchun "keep-alive")
+# FLASK VEB-SERVER (Render.com uxlab qolmasligi uchun)
 # ------------------------------------------------------------------
 app = Flask(__name__)
 
@@ -53,25 +64,21 @@ def index():
     return "Bot is alive!"
 
 def run_flask():
-    """Flask serverni fonda ishga tushirish."""
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
 # ------------------------------------------------------------------
-# QIDIRUV VA NATIJALARNI KO'RSATISH
+# QIDIRUV FUNKSIYASI
 # ------------------------------------------------------------------
-def search_youtube(query, max_results=8):
-    """
-    YouTube'dan qo'shiqlarni qidiradi va natijalarni qaytaradi.
-    Har bir natija: {'title': ..., 'url': ...} ko'rinishida.
-    """
+def search_youtube(query, max_results=7):
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': True,
+        'ignoreerrors': True, # Xatoliklarni e'tiborsiz qoldirish
         'extractor_args': {
             'youtube': {
-                'player_client': ['android']
+                'player_client': ['android', 'ios', 'web']
             }
         }
     }
@@ -79,42 +86,34 @@ def search_youtube(query, max_results=8):
         try:
             info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
             results = []
-            for entry in info.get('entries', []):
-                if entry:
-                    results.append({
-                        'title': entry.get('title', 'Noma\'lum'),
-                        'url': f"https://www.youtube.com/watch?v={entry['id']}"
-                    })
+            if info and 'entries' in info:
+                for entry in info['entries']:
+                    if entry:
+                        results.append({
+                            'title': entry.get('title', 'Noma\'lum'),
+                            'url': entry.get('url') or f"https://www.youtube.com/watch?v={entry.get('id')}"
+                        })
             return results
         except Exception as e:
-            print(f"Qidiruv xatosi: {e}")
+            logger.error(f"Qidiruv xatosi: {e}")
             return []
 
 def send_search_results(chat_id, query):
-    """Qidiruv natijalarini ro'yxat va inline tugmalar bilan yuboradi."""
     results = search_youtube(query)
     if not results:
         bot.send_message(chat_id, "😔 Hech narsa topilmadi. Boshqa so'z bilan urinib ko'ring.")
         return
 
-    # Natijalarni foydalanuvchi uchun saqlash
     user_search_results[chat_id] = results
 
-    # Xabar matnini shakllantirish
     text = "🎵 **Qidiruv natijalari:**\n\n"
     for i, item in enumerate(results, start=1):
         text += f"{i}. {item['title']}\n"
 
     text += "\n👇 Yuklab olish uchun raqamni bosing:"
 
-    # Inline tugmalar (raqamlar)
     markup = InlineKeyboardMarkup()
-    buttons = []
-    for i in range(len(results)):
-        buttons.append(InlineKeyboardButton(
-            text=f" {i+1} ",
-            callback_data=f"dl_{i}"
-        ))
+    buttons = [InlineKeyboardButton(text=f" {i+1} ", callback_data=f"dl_{i}") for i in range(len(results))]
     markup.row(*buttons)
 
     bot.send_message(chat_id, text, reply_markup=markup, parse_mode='Markdown')
@@ -135,24 +134,25 @@ def start_command(message):
 
 @bot.message_handler(func=lambda message: True)
 def handle_query(message):
-    """Foydalanuvchi yuborgan matn bo'yicha qidiruv."""
     query = message.text.strip()
     if not query:
-        bot.reply_to(message, "Iltimos, qo'shiq nomi yoki xonanda ismini yozing.")
         return
-
+        
     bot.send_chat_action(message.chat.id, 'typing')
-    send_search_results(message.chat.id, query)
+    try:
+        send_search_results(message.chat.id, query)
+    except Exception as e:
+        logger.error(traceback.format_exc()) # Xatoni Render loglariga yozadi
+        bot.reply_to(message, "❌ Qidiruvda xatolik yuz berdi. Iltimos, boshqa so'z bilan urinib ko'ring.")
 
 # ------------------------------------------------------------------
-# INLINE TUGMA BOSILGANDA (AUDIO YUKLASH)
+# TUGMA BOSILGANDA YUKLASH
 # ------------------------------------------------------------------
 @bot.callback_query_handler(func=lambda call: call.data.startswith('dl_'))
 def download_audio(call):
     chat_id = call.message.chat.id
     message_id = call.message.message_id
 
-    # Foydalanuvchi natijalarini olish
     results = user_search_results.get(chat_id)
     if not results:
         bot.answer_callback_query(call.id, "⚠️ Natijalar topilmadi. Qaytadan qidiring.")
@@ -174,50 +174,45 @@ def download_audio(call):
             chat_id, message_id, parse_mode='Markdown'
         )
 
-        # yt-dlp orqali audio yuklash
         with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
             info = ydl.extract_info(video_url, download=True)
-            # Postprocessor natijasidan fayl nomini olish
-            filename = ydl.prepare_filename(info)
-            # FFmpeg MP3 ga o'girgandan so'ng fayl kengaytmasi .mp3 bo'ladi
-            base, _ = os.path.splitext(filename)
-            mp3_file = base + '.mp3'
+            video_id = info.get('id')
+            
+            # MP3 faylni topish
+            mp3_file = os.path.join(DOWNLOAD_DIR, f"{video_id}.mp3")
+            if not os.path.exists(mp3_file):
+                possible_files = glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}.*"))
+                mp3_files = [f for f in possible_files if f.endswith('.mp3')]
+                if mp3_files:
+                    mp3_file = mp3_files[0]
+                else:
+                    raise FileNotFoundError("MP3 fayl topilmadi.")
 
-        # Fayl mavjudligini tekshirish
-        if not os.path.exists(mp3_file):
-            # Ba'zan fayl nomi boshqacha bo'lishi mumkin
-            possible = [f for f in os.listdir(DOWNLOAD_DIR) if f.endswith('.mp3')]
-            if possible:
-                mp3_file = os.path.join(DOWNLOAD_DIR, possible[0])
-            else:
-                raise FileNotFoundError("MP3 fayl topilmadi.")
-
-        # Audio faylni yuborish
         with open(mp3_file, 'rb') as audio:
             bot.send_audio(
                 chat_id,
                 audio,
                 title=title,
                 performer="YouTube",
-                caption=f"🎵 **{title}**\n\n✅ @{(bot.get_me()).username} orqali yuklab olindi."
+                caption=f"🎵 **{title}**\n\n✅ Bot orqali yuklab olindi."
             )
 
-        # Xabarni yangilash
         bot.edit_message_text(
             f"✅ **Tayyor!** «{title}» yuborildi.",
             chat_id, message_id, parse_mode='Markdown'
         )
 
-        # Faylni o'chirish (xotirani tejash)
-        try:
-            os.remove(mp3_file)
-        except Exception as e:
-            print(f"Faylni o'chirishda xato: {e}")
+        # Barcha ortiqcha fayllarni o'chirish (xotirani tozalash)
+        for f in glob.glob(os.path.join(DOWNLOAD_DIR, f"{video_id}.*")):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
 
     except Exception as e:
-        print(f"Yuklash xatosi: {e}")
+        logger.error(traceback.format_exc()) # Xatoni Render loglariga yozadi
         bot.edit_message_text(
-            f"❌ **Xatolik yuz berdi.**\n\nIltimos, keyinroq qayta urinib ko'ring.",
+            f"❌ **Yuklashda xatolik yuz berdi.**\n\nYouTube blokirovkasi bo'lishi mumkin. Boshqa qo'shiqni sinab ko'ring.",
             chat_id, message_id, parse_mode='Markdown'
         )
 
@@ -225,15 +220,13 @@ def download_audio(call):
 # ISHGA TUSHIRISH
 # ------------------------------------------------------------------
 if __name__ == '__main__':
-    # Flask serverni fonda ishga tushirish
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
 
-    print("🤖 Bot ishga tushdi...")
-    # Botni to'xtovsiz ishlatish (polling)
+    logger.info("🤖 Bot ishga tushdi...")
     while True:
         try:
             bot.polling(none_stop=True, interval=0, timeout=20)
         except Exception as e:
-            print(f"Polling xatosi: {e}")
+            logger.error(f"Polling xatosi: {e}")
             time.sleep(5)
